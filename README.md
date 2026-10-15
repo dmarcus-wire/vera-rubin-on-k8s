@@ -4,25 +4,25 @@
 
 ## Customer intent and the questions
 
-Since the introduction of NVIDIA Vera Rubin, my experience with those evaluating an NVL72 deployment has been more rigorous than most systems to date, like the NVIDIA SuperPOD. What is the planned purpose for such an investment? A self-hosted frontier AI platform — their own equivalent of what Anthropic and OpenAI deliver centrally, where interactive chat, coding and research agents, deep-reasoning workflows, document and data processing pipelines, and specialized domain assistants are all served from one cluster behind the customer's own firewall — for two reasons that increasingly travel together.
+Since the introduction of NVIDIA Vera Rubin, my experience with those evaluating an NVL72 deployment has been more rigorous than most systems to date, like the NVIDIA SuperPOD. What is the planned purpose for such an investment? A self-hosted frontier AI platform — a completely contained equivalent of what Anthropic and OpenAI deliver centrally, where interactive chat, coding and research agents, deep-reasoning workflows, document and data processing pipelines, and specialized domain assistants are all served from one cluster behind the customer's own firewall — for two reasons that increasingly travel together.
 
 The first is containing the **runaway hosted-API spend** that has eaten through the "blank check to get off the ground with AI" budgets of the past few years. Finance now wants a predictable cost ceiling and demonstrable ROI, not an open-ended per-token invoice that grows with every new use case. Above a certain query volume, dedicated hardware beats hosted-API pricing by a wide margin even with current cost of hardware rising, and the delta grows with context length and query concurrency.
 
 The second is **protecting IP** — especially the proprietary data that is the customer's real competitive advantage. Enterprise AI value comes overwhelmingly from the data an organization has accumulated and curated over years: customer records, operational history, source code, strategy documents, clinical or client outcomes, trading patterns, domain-specific telemetry. The model has become a commodity; the data is and has been the moat. Keeping queries, documents, source code, and model weights on-premise means none of that moat traverses a third-party inference API or ends up as training signal in someone else's next model.
 
-Both motivations point to the same architecture, and the capital expense only pencils out at near-continuous utilization — requiring a mixture of production inference and scheduled training on the same cluster around the clock. In my previous life we enjoyed the problem of melting the systems around the 12 month mark because utilization was 24/7. Everything downstream in this doc ties back to those two intents.
+Both motivations point to the same architecture, and the capital expense only pencils out at near-continuous utilization — requiring a mixture of production inference and scheduled training on the same cluster around the clock. In my previous life, we enjoyed the problem of melting the systems around the 12 month mark because utilization was 24/7. Everything downstream in this doc ties back to those two intents.
 
 Five technical questions determine whether the architecture actually delivers on that intent. The first three are the ones most often run together in customer planning conversations.
 
-1. **Orchestration.** Is Kubernetes the right scheduler to deliver these use cases, or do other schedulers and hypervisors earn a place alongside or instead of it?
+1. **Orchestration.** Is Kubernetes the right scheduler to deliver these AI use cases, or do other schedulers and hypervisors earn a place alongside or instead of it?
 
     Short answer: it depends on the system’s purpose.
 
     - For enterprise self-hosted AI platforms — where the workload is a mix of inference, training, and the surrounding application plane serving many consumers 24/7 — Kubernetes is the dominant pattern today.
 
-    - For pure training, Slurm still dominates frontier AI research labs. Meta, Mistral, and essentially every national supercomputing lab run it, and NVIDIA explicitly recommends Slurm over Kubernetes for pre-training.
+    - For pure training, Slurm is still the most common scheduler — it runs roughly two-thirds of the TOP500 — but the frontier labs are split: OpenAI has trained on Kubernetes since the GPT-3 era, Meta trained Llama 3 on its own scheduler (MAST), and Mistral runs Slurm on top of Kubernetes. The trend is convergence, not a winner: NVIDIA now owns both Slurm's developer (SchedMD) and Run:ai, and Slurm-on-Kubernetes projects (Slinky, SUNK) give researchers Slurm's job interface on a Kubernetes-managed cluster.
 
-    - Hypervisors earn their place for everything around the GPU racks — the application plane, auth, observability — but not on the racks themselves. Addressed in its own section below.
+    - Hypervisors earn their place around the GPU racks, not on them. Two cases come up most: large multi-socket CPU servers, where splitting one host into a VM per socket gives Kubernetes right-sized nodes with local memory instead of one oversized node; and teams with deep hypervisor experience but no bare-metal Kubernetes practice, who can run the application plane (gateways, auth, observability, vector databases) on infrastructure they already operate. The GPU racks run bare-metal Kubernetes either way. Addressed in its own section below; on 8-GPU servers, below rack scale, virtualizing the GPU hosts is also a supported option (see Alternatives).
 
     The alternatives win in specific niches but miss the full enterprise-platform picture.
 
@@ -356,7 +356,8 @@ What else is needed? Nothing architectural. The question in this section is abou
 
 ### Where Kubernetes-on-hypervisor earns its keep
 
-- **Reuse existing operational muscle.** The VI admin team already runs vSphere; the platform team focuses on the Kubernetes layer rather than owning bare-metal provisioning.
+- **Reuse existing operational muscle.** The VI admin team already runs vSphere; the platform team focuses on the Kubernetes layer rather than owning bare-metal provisioning. The GPU racks still need bare-metal skills; those usually come from vendor provisioning tooling (NVIDIA Base Command Manager, part of Mission Control) or a partner rather than being built from scratch.
+- **Large multi-socket hosts.** A 4-socket server with hundreds of cores and terabytes of memory makes a poor single Kubernetes node: the kubelet allows 110 pods per node by default, memory access across sockets is slower than local access, and one host failure takes a large slice of the cluster with it. One VM per socket gives right-sized nodes with local memory and a smaller blast radius.
 - **Mixed workload consolidation.** The same physical cluster runs Kubernetes workloads alongside the long tail of legacy VMs that are not going away.
 - **vSphere availability guarantees.** HA, DRS, and vMotion give Kubernetes nodes availability properties that the Kubernetes layer does not natively provide — a worker node evacuates onto healthy hardware transparently.
 - **Storage, networking, and backup abstraction.** vSphere CSI, NSX microsegmentation, and VM-level backup via Veeam, Rubrik, or Cohesity give one operational regime that covers everything.
@@ -366,7 +367,9 @@ What else is needed? Nothing architectural. The question in this section is abou
 - **NVIDIA AI Enterprise support is bare-metal-only** for GH200, GB200, and GB300 NVL72 systems. Vera Rubin NVL72 will almost certainly inherit this constraint. Running Kubernetes workers as VMs on vSphere on those racks puts the deployment outside NVAIE support.
 - **MNNVL topology awareness assumes direct hardware access.** The GPU Operator's clique labeling, the DRA driver's ComputeDomain discovery, and Topograph's switch-tree mapping all assume the Kubernetes node is the physical node. These abstractions have not been designed or tested for VM-virtualized rack-scale NVL72.
 - **vGPU does not model this workload.** vGPU virtualizes a GPU across multiple VMs for VDI or lighter inference. Rack-scale NVLink training needs the opposite — one workload consuming many GPUs across many nodes with fabric coherence. Different problem entirely.
-- **Performance headroom matters at this capex.** A 5–15% hypervisor overhead on a multi-million-dollar rack is a six-figure annual cost per rack in lost throughput. The ROI math that justified the purchase assumed full-performance access to the silicon.
+- **Performance is not the main argument.** VMware's published MLPerf results put virtualized single-node H100 inference at 98–100% of bare metal. The case for bare metal on NVL72 rests on support and topology (above), not overhead — at this capex, even a few percent is worth keeping, but it is not what decides the question.
+
+This is a rack-scale NVLink rule, not a general GPU rule; see the Alternatives section for where a hypervisor fits on 8-GPU servers.
 
 ### The right pattern
 
@@ -478,6 +481,12 @@ This is the hardest NVIDIA capability to match. NVLink is proprietary, physicall
 - **GPU alternative, same architecture pattern.** Different device plugin (AMD GPU Operator, Intel Gaudi Operator), different driver, different low-level collective library (RCCL instead of NCCL for AMD, HCCL for Gaudi). Same Kubernetes substrate, same Multus plus SR-IOV networking, same Kueue gang scheduling, same KServe plus vLLM serving stack. vLLM runs on ROCm today and increasingly on Gaudi.
 - **Non-NVIDIA scale-out network.** Little architectural change. The Kubernetes abstractions (NetworkAttachmentDefinition, SR-IOV VFs, RoCEv2 RDMA) are vendor-neutral. The NIC driver and firmware change; the pod-level networking pattern does not.
 - **UALink scale-up fabric when it ships.** New topology primitives analogous to NVLink cliques will emerge. Expect the DRA driver model to generalize, with ComputeDomains becoming vendor-neutral rather than NVIDIA-specific. The scheduling model in this document carries forward.
+- **The hypervisor question reopens below rack scale.** The bare-metal rule in this doc comes from rack-scale NVLink: NVAIE support for NVL72 systems is bare-metal only, and the clique and ComputeDomain machinery assumes physical nodes. On 8-GPU HGX servers (H200, B200, B300) and PCIe GPUs, virtualization is a supported path: NVIDIA's Fabric Manager supports full GPU passthrough and splitting one HGX server into isolated 1-, 2-, 4-, or 8-GPU VMs with full NVLink bandwidth inside each, and VMware Private AI Foundation with NVIDIA supports NVSwitch on HGX and GPUDirect RDMA across HGX servers. What the hypervisor adds there:
+  - **Isolation between tenants:** a VM boundary is harder to break out of than a Kubernetes namespace.
+  - **GPU sharing:** vGPU and partitions let many small inference models share hardware.
+  - **Existing skills:** the VI team you already have can run it.
+
+  What it does not add is vMotion: VMs with passthrough GPUs cannot live-migrate, so GPU resilience still comes from replicas and checkpoints.
 - **Software ecosystem gap.** This is where the real trade shows up. NVIDIA's CUDA ecosystem — frameworks tested first on NVIDIA, NIM inference containers, Run:ai integration, DCGM observability — has roughly a one-to-two-year lead on AMD's equivalent, and a longer lead on Intel's. For production AI platform work in 2026, this means more platform engineering effort on non-NVIDIA stacks, not fundamental infeasibility.
 
 ### How to frame the alternatives conversation with customers
@@ -534,6 +543,10 @@ Organized by topic. Each link was verified during the research for this doc.
 - GitHub — [CodeFlare](https://github.com/project-codeflare/codeflare-operator)
 - Apache — [YuniKorn (resource scheduler with fair-share and quotas)](https://yunikorn.apache.org/)
 - GitHub — [Armada (G-Research, large-scale batch workload orchestration)](https://github.com/armadaproject/armada)
+- NVIDIA Blog — [NVIDIA Acquires Open-Source Workload Management Provider SchedMD (Slurm's developer, December 2025)](https://blogs.nvidia.com/blog/nvidia-acquires-schedmd)
+- SchedMD — [Slinky (Slurm on Kubernetes)](https://slurm.schedmd.com/slinky.html)
+- NVIDIA — [Slinky: Slurm Workload Management for Kubernetes](https://www.nvidia.com/en-us/software/slinky/)
+- CoreWeave — [SUNK (Slurm on Kubernetes)](https://www.coreweave.com/products/sunk)
 
 ### Inference engines
 
@@ -576,11 +589,31 @@ Organized by topic. Each link was verified during the research for this doc.
 ### Kubernetes AI/ML infrastructure milestones
 
 - Kubernetes Blog — [Kubernetes v1.34: DRA has graduated to GA](https://kubernetes.io/blog/2025/09/01/kubernetes-v1-34-dra-updates/)
+- Kubernetes Blog — [Kubernetes v1.35 release (Workload API and native gang scheduling, alpha)](https://kubernetes.io/blog/2025/12/17/kubernetes-v1-35-release/)
+- Kubernetes Docs — [Gang Scheduling](https://www.kubernetes.io/docs/concepts/scheduling-eviction/gang-scheduling/)
 
 ### NVIDIA AI Enterprise (support matrix, licensing)
 
 - NVIDIA Docs — [NVAIE Support Matrix (release 7)](https://docs.nvidia.com/ai-enterprise/release-7/latest/support/support-matrix.html)
 - NVIDIA Docs — [NVAIE Quick Start Guide](https://docs.nvidia.com/ai-enterprise/release-7/latest/getting-started/quick-start-guide.html)
+
+### GPU virtualization below rack scale (HGX and PCIe)
+
+- NVIDIA Docs — [Fabric Manager User Guide (full passthrough, shared NVSwitch, and vGPU virtualization models)](https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html)
+- NVIDIA Docs — [Shared NVSwitch GPU Passthrough Virtualization Integration Guide (1/2/4/8-GPU partitions on HGX)](https://docs.nvidia.com/hgx-platforms/shared-nvswitch-gpu-passthrough-virtualization-integration-guide.pdf)
+- Broadcom TechDocs — [VMware Private AI Foundation with NVIDIA 9.1 (NVSwitch on HGX, GPUDirect RDMA across HGX servers)](https://techdocs.broadcom.com/content/dam/broadcom/techdocs/us/en/pdf/vmware/private-ai/private-ai-nvidia/vmware-private-ai-foundation-with-nvidia-9-1.pdf)
+- Broadcom TechDocs — [Configure NVIDIA vGPU or GPU Passthrough for AI Workloads on the ESX Hosts](https://techdocs.broadcom.com/us/en/vmware-cis/private-ai/foundation-with-nvidia/9-0/private-ai-foundation-9-x/deploying-private-ai-foundation-with-nvidia/configure-nvidia-vgpu-or-gpu-passthrough-on-the-esx-hosts.html)
+- VMware Blog — [Large Language Model Inference Performance with NVIDIA AI Enterprise for VMware vSphere (H100 vGPU, near bare-metal MLPerf results)](https://blogs.vmware.com/cloud-foundation/2023/10/02/vsphere-nvaie-llm/)
+- VMware Blog — [No Virtualization Tax for MLPerf Inference 3.0 Using NVIDIA Hopper and Ampere vGPUs](https://blogs.vmware.com/performance/2023/04/no-virtualization-tax-for-mlperf-inference-v3-0-using-nvidia-hopper-and-ampere-vgpus-and-nvidia-ai-software-with-vsphere-8-0-1.html)
+
+### Who schedules frontier training today
+
+- Meta — [The Llama 3 Herd of Models (Llama 3 405B scheduled by MAST, Meta's training scheduler)](https://arxiv.org/pdf/2407.21783)
+- OpenAI — [Scaling Kubernetes to 7,500 nodes](https://openai.com/index/scaling-kubernetes-to-7500-nodes/)
+- CoreWeave Blog — [Mistral AI on GB200 NVL72 with SUNK (Slurm on Kubernetes)](https://www.coreweave.com/blog/mistral-ai-unlocks-2-5x-faster-training-speeds-with-nvidia-gb200-nvl72-on-coreweave)
+- LLNL — [El Capitan: Running Jobs with Flux](https://hpc.llnl.gov/documentation/user-guides/using-el-capitan-systems/running-jobs-flux-and-mpi)
+- Wikipedia — [Aurora (Argonne, PBS scheduler)](https://en.wikipedia.org/wiki/Aurora_(supercomputer))
+- NVIDIA Docs — [Mission Control overview (Slurm or Run:ai on Kubernetes)](https://docs.nvidia.com/mission-control/docs/systems-administration-guide/latest/overview.html)
 
 ### Industry analysis cited in this doc
 
