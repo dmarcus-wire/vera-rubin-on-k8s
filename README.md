@@ -1,6 +1,6 @@
 # Kubernetes on Vera Rubin — Architecture, Scheduling, and Open Source
 
-![Self-hosted AI platform behind the customer firewall: chat, agents, pipelines, and domain workloads on a Kubernetes orchestration layer spanning two NVL72 racks](./main-vr-concept.svg)
+![From design to day-one operational: hardware design, software platform, and alternatives happen before the racks arrive; day 1 is bring-up and validation; day 2 is operating 24/7](./journey.svg)
 
 ## Customer intent and the questions
 
@@ -12,6 +12,8 @@ The second is **protecting IP** — especially the proprietary data that is the 
 
 Both motivations point to the same architecture, and the capital expense only pencils out at near-continuous utilization — requiring a mixture of production inference and scheduled training on the same cluster around the clock. In my previous life, we enjoyed the problem of melting the systems around the 12 month mark because utilization was 24/7. Everything downstream in this doc ties back to those two intents.
 
+![Self-hosted AI platform behind the customer firewall: chat, agents, pipelines, domain assistants, and training on a Kubernetes orchestration layer spanning two NVL72 racks](./main-vr-concept.svg)
+
 Five technical questions determine whether the architecture actually delivers on that intent. The first three are the ones most often run together in customer planning conversations.
 
 1. **Orchestration.** Is Kubernetes the right scheduler to deliver these AI use cases, or do other schedulers and hypervisors earn a place alongside or instead of it?
@@ -22,7 +24,7 @@ Five technical questions determine whether the architecture actually delivers on
 
     - For pure training, Slurm is still the most common scheduler — it runs roughly two-thirds of the TOP500 — but the frontier labs are split: OpenAI has trained on Kubernetes since the GPT-3 era, Meta trained Llama 3 on its own scheduler (MAST), and Mistral runs Slurm on top of Kubernetes. The trend is convergence, not a winner: NVIDIA now owns both Slurm's developer (SchedMD) and Run:ai, and Slurm-on-Kubernetes projects (Slinky, SUNK) give researchers Slurm's job interface on a Kubernetes-managed cluster.
 
-    - Hypervisors earn their place around the GPU racks, not on them. Two cases come up most: large multi-socket CPU servers, where splitting one host into a VM per socket gives Kubernetes right-sized nodes with local memory instead of one oversized node; and teams with deep hypervisor experience but no bare-metal Kubernetes practice, who can run the application plane (gateways, auth, observability, vector databases) on infrastructure they already operate. The GPU racks run bare-metal Kubernetes either way. Addressed in its own section below; on 8-GPU servers, below rack scale, virtualizing the GPU hosts is also a supported option (see Alternatives).
+    - Hypervisors earn their place around the GPU racks, not on them — on the separate racks of general-purpose servers that run the application plane. Two cases come up most: large multi-socket CPU servers, where splitting one host into a VM per socket gives Kubernetes right-sized nodes with local memory instead of one oversized node; and teams with deep hypervisor experience but no bare-metal Kubernetes practice, who can run the application plane (gateways, auth, observability, vector databases) on infrastructure they already operate. The GPU racks run bare-metal Kubernetes either way. Addressed in its own section below; on 8-GPU servers, below rack scale, virtualizing the GPU hosts is also a supported option (see Alternatives).
 
     The alternatives win in specific niches but miss the full enterprise-platform picture.
 
@@ -44,9 +46,29 @@ Five technical questions determine whether the architecture actually delivers on
 
     Short answer: every component in the critical path should start with Apache 2.0 open source; the enterprise-supported and proprietary pieces are either hardware-adjacent or optional value-add on top.
 
-The rest of this post works each question in turn: a fabric-topology picture, two concrete scenarios (36-GPU and 144-GPU jobs), the parallelism strategy that makes spanning work, failure handling, the 24/7 saturation pattern that drives the whole business case, the common misconception that Kubernetes itself is the limiting factor, the related meta-questions of whether Kubernetes is the right technology at all and whether to run it on a hypervisor like vSphere, the 100% open source stack that makes everything work (and the narrow set of pieces that stay proprietary), takeaways for architects, and finally the alternative hardware paths if Vera Rubin itself is not the right fit.
+The rest of this doc follows the order customers tend to think in:
 
-## The fabric picture
+1. **[Part 1: The hardware design](#part-1-the-hardware-design)** — compute, network, and storage, and what the rack boundary forces on parallelism. Answers *Sizing*.
+2. **[Part 2: The software layers that make it a platform](#part-2-the-software-layers-that-make-it-a-platform)** — orchestration, hypervisors, scheduling, resilience, 24/7 utilization, and how much of the stack is open source. Answers *Orchestration*, *Resilience*, *Utilization*, and *Portability*.
+3. **[Part 3: Alternative hardware designs](#part-3-alternative-hardware-designs)** — what changes if Vera Rubin itself is not the right fit.
+4. **[Part 4: Operational on day one](#part-4-operational-on-day-one)** — build and prove the platform before the racks arrive, bring them up and validate them on delivery, then operate them 24/7.
+
+It closes with [takeaways for architects](#what-this-means-for-architects).
+
+## Part 1: The hardware design
+
+Customers start here, and so does the architecture: the compute, network, and storage design sets the physical limits every software decision has to respect. The most important of those limits is that NVLink stops at the rack.
+
+### Compute: the NVL72 rack
+
+The unit of design is the rack, not the server. One Vera Rubin NVL72 rack holds 72 Rubin GPUs and 36 Vera CPUs in 18 compute trays (4 GPUs and 2 CPUs each). Each GPU carries 288 GB of HBM4 — about 20.7 TB per rack — and supports FP4 natively. NVLink switch trays connect all 72 GPUs to each other at 3.6 TB/s per GPU, so the whole rack behaves as one memory-coherent domain: any GPU reaches any other at full NVLink speed, whichever tray it sits in. The rack is 100% liquid-cooled, using warm water at a 45 °C supply temperature; there is no air-cooled version, which makes facility readiness one of the longest-lead items in the project (Part 4).
+
+Two consequences shape everything that follows:
+
+- **The rack is the scale-up boundary.** Inside it, GPUs talk over NVLink. Between racks, traffic drops to the scale-out network at roughly 1/20th of the bandwidth (next section).
+- **The server is no longer the boundary.** On 8-GPU servers, NVLink stopped at the server. On NVL72, a 4-GPU compute tray is just one slot in the rack. Kubernetes still sees each tray as a node — 18 nodes per rack — which is why scheduling has to know which nodes share a rack.
+
+### Network: the fabric picture
 
 ![Fabric topology: control plane, two NVL72 racks, three network planes](./the-fabric-picture.svg)
 
@@ -56,7 +78,17 @@ Three network planes to keep straight:
 2. NVLink is intra-rack only — 72 GPUs form one memory-coherent domain per rack (NVIDIA's term for the NVL72 architecture, where GPUs share a unified memory address space over the NVLink fabric), and the fabric physically ends at the rack.
 3. The scale-out ConnectX-9 fabric (Spectrum-X Ethernet or Quantum-X800 InfiniBand) carries everything that crosses racks, including GPUDirect RDMA for distributed training.
 
-## Scenario 1: 36-GPU training job fits in one 72-GPU rack
+### Storage: what it has to keep up with
+
+Storage gets less attention than compute and network in most Vera Rubin conversations, but three parts of this design lean on it hard:
+
+- **Checkpoints.** Training resilience is checkpoint-and-restart (Part 2), so checkpoint write and restore bandwidth decides how often a long job can checkpoint and how long recovery takes. Fluid and Alluxio are the open source options for accelerating checkpoint I/O on Kubernetes.
+- **Model weights.** A 405B model in FP8 is about 405 GB that has to be read into GPU memory every time a replica starts. Storage read bandwidth is a large part of why a cold start takes minutes, not seconds.
+- **Shared prefix and KV cache.** Agent-heavy inference reuses the same system prompts and tool definitions constantly. A shared cache tier lets new or recovered replicas warm up without recomputing them.
+
+BlueField-4 DPUs carry storage and offload traffic alongside the ConnectX-9 scale-out network (see the fabric diagram above).
+
+### Scenario 1: 36-GPU training job fits in one 72-GPU rack
 
 36 Rubin GPUs give roughly 10 TB of HBM4 (high-bandwidth memory stacked beside each GPU for maximum throughput) inside one NVLink domain. That footprint comfortably holds workloads like:
 
@@ -79,7 +111,7 @@ Can Kubernetes do this today? Yes.
 
 What else is needed? NVIDIA GPU Operator (clique labeling), a gang scheduler (Kueue, Volcano, or KAI), and a training launcher (torchrun, Kubeflow Training Operator, or KubeRay). All open source, all shipping today.
 
-## Scenario 2: 144-GPU training job must span two racks
+### Scenario 2: 144-GPU training job must span two racks
 
 144 Rubin GPUs give ~41 TB of HBM4 across two NVLink domains. Memory is rarely the reason to go this big — Scenario 1 showed that a 405B full fine-tune fits in half a rack. The reasons to span two racks are speed and workload shape:
 
@@ -95,65 +127,32 @@ Can Kubernetes do this today? Yes.
 
 What else is needed? Everything from Scenario 1, plus the NVIDIA DRA Driver (ComputeDomains for cross-rack topology awareness), Multus CNI, and the SR-IOV Network Operator for GPUDirect RDMA over the ConnectX-9 fabric. DRA went GA in Kubernetes 1.34 and the pieces have all landed in the last 18 months.
 
+### Parallelism strategy aligned to the fabric hierarchy
 
-## Parallelism strategy aligned to the fabric hierarchy
+**In short:** splitting a model across GPUs creates three kinds of traffic. Tensor parallelism splits every layer and talks constantly, so it stays on NVLink inside a rack. Pipeline stages and data-parallel copies talk far less, so they can cross racks on the scale-out network, which is about 20x slower. Design the split so only the quiet traffic crosses racks, and spanning racks costs little.
 
-### Primer on parallelism
+#### The three ways to split a model
 
-Parallelism is the general technique of splitting a workload across many GPUs so it finishes faster or so it fits where it otherwise would not. It exists because frontier models are too large for a single GPU — a 405B model in FP8 is roughly 405 GB of weights, and a Rubin GPU has 288 GB. Something has to split the model across GPUs. That something is a parallelism strategy, and it decides *how* the split happens: which GPU holds what, which GPUs talk to which, and when.
+Frontier models are too big for one GPU — a 405B model in FP8 is about 405 GB of weights, and a Rubin GPU has 288 GB — so training splits the work across GPUs in up to three ways at once:
 
-**In training.** Parallelism splits a single large job across many GPUs so the whole job runs together as one coordinated unit. The three dimensions you'll see named — tensor, pipeline, and data — are three different *axes* along which the split can happen, and real training jobs use all three at once. Tensor parallelism splits each layer's math across GPUs; pipeline parallelism splits the sequence of layers across GPUs; data parallelism splits the training data across GPUs that each hold the same model. The job runs on all of them simultaneously, and they coordinate through collectives like all-reduce.
+1. **Tensor parallel (TP), inside each rack.** Splits each layer's math across GPUs, usually 8. Every layer ends with an all-reduce — each GPU contributes a partial result, the results are combined, and every GPU gets a copy of the total — which makes this by far the chattiest traffic. It stays on NVLink. On NVL72 any 8 GPUs in the same rack qualify, even across compute trays: the boundary that matters is the rack, not the server.
+2. **Pipeline parallel (PP), across racks.** Splits the sequence of layers into stages. Each stage hands its activations to the next with a point-to-point send, far less traffic than tensor parallelism, so pipeline hand-offs tolerate the drop to ConnectX-9 speeds over GPUDirect RDMA.
+3. **Data parallel (DP), around everything else.** Once one copy of the model is laid out with tensor and pipeline parallelism, every remaining GPU becomes another copy working on different data: total GPUs ÷ (TP × PP). The copies average their gradients with one all-reduce per step — large but infrequent — so data parallelism tolerates the slowest links in the topology.
 
-**In inference.** Parallelism splits one serving replica across the GPUs it needs to hold the model. A 405B model at FP8 is about 405 GB, so on 288 GB Rubin GPUs it needs at least 2 GPUs just to fit, and usually 4 to leave room for the KV cache — tensor parallelism is doing the splitting. (Training the same model needs far more memory, because gradients and optimizer state come along too.) But unlike training, inference does not run one coordinated job across the whole cluster. Instead, it runs many *independent* replicas in parallel, each one serving its own stream of requests. The parallelism inside a replica is the same primitive as training's tensor parallelism; what's different is that the replicas themselves don't coordinate with each other.
+Inference uses the same building blocks differently. One serving replica uses tensor parallelism across the GPUs it needs to hold the model (a 405B model needs at least 2 Rubin GPUs to fit, usually 4 to leave room for the KV cache), and the platform runs many independent replicas rather than one coordinated job. Training schedules one large job that grows with rack count; inference schedules many small replicas that multiply with it.
 
-The unit of measure is different in training and inference, and it drives everything else about how the architecture is sized and scheduled. **Training schedules one large job that grows as rack count grows** — tensor-parallel groups inside each rack, pipeline stages across racks, data-parallel replicas wrapping the whole topology. **Inference schedules many small replicas that multiply as rack count grows** — each replica is a self-contained serving unit of typically 2 to 8 GPUs on Rubin, independent of the others, scaling up and down with queue depth. (MoE models served with wide expert parallelism are the exception and can span a whole rack.)
-
-Both use the same primitives (tensor parallelism, gang scheduling, NVLink-aware placement). What differs is whether the primitive is doing coordination inside one giant workload or isolation around many small ones.
-
-### Primer on all-reduce
-
-The fabric placement decision in the rest of this section hinges on what an all-reduce actually does. In one sentence: every participating GPU contributes a tensor, the tensors are combined (summed, averaged) across all participants, and every GPU ends up with a copy of the combined result. "Reduce" is combining; "all" means every participant ends up with the combined output. It is the primitive that keeps GPUs in sync during distributed training.
-
-Tensor parallelism uses it on every layer to combine partial activation results from GPUs that are splitting one layer's math. Pipeline parallelism does not use all-reduce at all — it uses point-to-point sends between adjacent stages, which is a much lighter primitive. Data parallelism uses all-reduce once per step to average gradients across replicas. The frequency and size of these operations is what makes some parallelism dimensions chatty and others not — and therefore what makes the fabric placement decision matter.
-
-Inference uses all-reduce too, and in production often uses it more than training does. A tensor-parallel serving replica runs two all-reduces on every layer (one after attention, one after the MLP) of every **forward pass** — the forward pass being one trip through the model's layers to produce a single output token. Frontier models are deep: Llama-3.1-405B has 126 layers. Generating a 1,000-token response from Llama-3.1-405B therefore triggers roughly 250,000 all-reduces across the TP group, and every one of them lands directly in user-visible latency.
-
-Training can tolerate occasional slow collectives because the overall step is seconds long — a 5ms hiccup inside a 10-second step is invisible. Inference cannot: tokens arrive one at a time at human-visible speed, and every slow collective shows up as sluggish typing from the user's perspective. The slow collectives are not occasional either — they repeat on every one of those 250,000 operations, so a small per-collective penalty becomes the dominant cost line item in serving latency.
-
-The fabric placement decision therefore applies at least as strongly to inference workloads, which is the shape most Vera Rubin deployments actually run around the clock.
-
-### Matching collectives to the fabric
-
-The principle is simple: put the chattiest collectives on the fastest fabric. The hard part is knowing which collective is the chattiest, and by how much.
-
-In distributed training, the chattiest collective by a wide margin is the **tensor-parallel all-reduce**. Training a 405B model like Llama-3.1-405B typically splits the work across many GPUs in three dimensions at once: tensor parallelism (chunks of each layer, usually across 8 GPUs), pipeline parallelism (sequential model stages, often across racks), and data parallelism (copies of the whole arrangement, synchronized once per step). Within a tensor-parallel group, each layer triggers two all-reduces on the forward pass and two more on the backward pass. Llama-3.1-405B's 126 layers mean roughly 500 all-reduces per micro-batch, each moving a few hundred megabytes of activations at an 8K sequence length — hundreds of gigabytes of traffic per training step.
-
-Why 8 GPUs per tensor-parallel group, when NVL72 has 72 on NVLink? On older 8-GPU servers, NVLink stopped at the server, so 8 was a hard limit. On NVL72 every GPU in the rack reaches every other GPU at full NVLink speed through the NVLink switch trays, so the server boundary (4 GPUs per compute tray) no longer matters — the rack boundary does. Tensor parallelism stays around 8 anyway for a software reason: splitting each layer into more pieces makes every piece too small to keep a GPU busy, while each all-reduce gets more expensive. NVL72's extra NVLink reach goes to expert parallelism in MoE models and to data-parallel groups that stay inside the rack.
-
-The other parallelism dimensions are far less demanding. Pipeline parallelism exchanges activations between stages on each micro-batch boundary — many small transfers, each carrying one activation tensor. Data parallelism synchronizes gradients just once per step; the transfer is large but infrequent. Tensor parallelism dominates the total bandwidth demand per training step, with pipeline parallelism distantly second and data parallelism a distant third — which is what makes the fabric placement decision obvious: tensor-parallel traffic has to stay on NVLink, and the other dimensions can tolerate the scale-out fabric.
-
-For a spanning job, the principle maps cleanly onto three parallelism dimensions:
-
-1. **Tensor parallel INSIDE each rack.** Every forward and backward pass triggers all-reduces across the tensor-parallel group. These are the chattiest collectives, so they stay on NVLink. On NVL72 any 8 GPUs in the same rack qualify, even across compute trays — the boundary that matters is the rack, not the server.
-2. **Pipeline parallel ACROSS racks.** Activation hand-offs between pipeline stages are far less chatty than tensor-parallel all-reduces. They tolerate the drop to ConnectX-9 speeds and run over GPUDirect RDMA.
-3. **Data parallel wraps everything else.** Once one copy of the model is laid out with tensor and pipeline parallelism, every remaining GPU becomes another data-parallel copy: total GPUs ÷ (TP × PP). With TP=8 and PP=2, 144 GPUs give 9 copies, 288 give 18, and 576 give 36. Gradient synchronization happens once per step, so data-parallel groups tolerate the slowest links in the topology.
-
-Can Kubernetes do this today? Yes, but the parallelism design itself lives in the training framework, not Kubernetes. The dominant frameworks for frontier training are Megatron-LM, DeepSpeed, PyTorch FSDP, and NVIDIA NeMo — all open source, all built on PyTorch. Each exposes the parallelism dimensions (tensor, pipeline, data, sequence, expert) as configuration knobs. Kubernetes’s job is to make sure the resulting process groups land on topology-aligned nodes via the clique labels; the framework decides what the process groups are and what they do.
-
-What else is needed? PyTorch (with FSDP, Megatron-LM, or DeepSpeed) handles the parallelism dimensions. Kubernetes’s job is to place the resulting process groups on topology-aligned nodes via the clique labels and the gang scheduler’s required-constraint configuration. If the scheduler is configured with “preferred” instead of “required” for clique placement, Kubernetes will silently let a TP group straddle a clique boundary and performance drops 3-10x.
-
-### Training parallelism
+#### What crosses the rack boundary
 
 ![What crosses the rack boundary at 1, 2, 4, and 8 racks: nothing at 1 rack, pipeline hand-offs at 2, pipeline hand-offs plus once-per-step gradient sync at 4 and 8](./parallelism-train.svg)
 
-Parallelism design happens in the training framework's configuration, not in Kubernetes. For a 144-GPU job on 2 racks running Megatron-LM, you would set:
+Parallelism is configured in the training framework, not in Kubernetes. For a 144-GPU job on 2 racks running Megatron-LM, you would set:
 
 - `--tensor-model-parallel-size 8` — eight GPUs per tensor-parallel group, inside one rack's NVLink domain (two 4-GPU compute trays).
 - `--pipeline-model-parallel-size 2` — two pipeline stages, one per rack, with activation hand-offs crossing the ConnectX-9 fabric.
 
-You do not set data parallelism directly; Megatron derives it from what is left: 144 ÷ (8 × 2) = 9 copies of the model, each working on different data. Megatron orders ranks so the pipeline dimension is outermost, which means each rack holds one complete pipeline stage and every data-parallel group sits inside one rack. Even gradient sync stays on NVLink; only the pipeline hand-offs cross the scale-out fabric. The framework builds process groups for each dimension; Kubernetes ensures those process groups land on topology-aligned nodes via the clique labels.
+You do not set data parallelism directly; Megatron derives it from what is left: 144 ÷ (8 × 2) = 9 copies of the model. Megatron orders ranks so the pipeline dimension is outermost, which means each rack holds one complete pipeline stage and every data-parallel group sits inside one rack. Even gradient sync stays on NVLink; only the pipeline hand-offs cross the scale-out fabric.
 
-What changes as you add racks is not which parallelism dimensions exist — data parallelism is there from the start — but which traffic has to cross the rack boundary:
+Adding racks does not add parallelism dimensions — data parallelism is there from the start. It changes which traffic has to cross the rack boundary:
 
 - **1 rack (72 GPUs):** nothing crosses. For example, TP=8 × DP=9, all on NVLink.
 - **2 racks (144 GPUs):** one dimension has to cross. With one pipeline stage per rack (TP=8, PP=2, DP=9), only pipeline hand-offs cross the scale-out fabric.
@@ -162,11 +161,112 @@ What changes as you add racks is not which parallelism dimensions exist — data
 
 In current customer conversations, four racks is the smallest deployment I am seeing considered.
 
-NCCL (NVIDIA Collective Communications Library — the low-level GPU-to-GPU communication layer used by every ML framework, including vLLM and llm-d) handles the fabric switching transparently. You tell your training framework (PyTorch FSDP, Megatron-LM, DeepSpeed) which parallelism dimension maps to which process group, and the gang scheduler places each process group on topology-aligned nodes using the clique labels. The NVIDIA DRA (Dynamic Resource Allocation — the Kubernetes 1.34 GA mechanism for exposing structured hardware resources beyond simple device counts) driver exposes NVLink cliques as `ComputeDomain` objects, so the scheduler treats "these 72 GPUs are memory-coherent" as a first-class scheduling constraint.
+#### Where Kubernetes fits
+
+The training framework — Megatron-LM, DeepSpeed, PyTorch FSDP, or NVIDIA NeMo, all open source and built on PyTorch — decides what the process groups are, exposing tensor, pipeline, data, sequence, and expert parallelism as configuration knobs. NCCL (NVIDIA Collective Communications Library, the GPU-to-GPU communication layer used by every ML framework, including vLLM and llm-d) picks NVLink inside a rack and GPUDirect RDMA between racks automatically; the framework code is the same either way.
+
+Kubernetes's job is to put each process group on the right nodes. The GPU Operator labels every node with its NVLink clique, and the NVIDIA DRA driver (DRA, Dynamic Resource Allocation, went GA in Kubernetes 1.34 and lets the scheduler see structured hardware rather than just device counts) exposes each rack's NVLink domain as a `ComputeDomain`. The gang scheduler uses both to keep every group where the design put it.
+
+**Configure clique placement as required, not preferred.** With "preferred," a full rack lets the scheduler quietly split a tensor-parallel group across two racks. The job still runs correctly, just 3–10x slower, and nothing raises an error.
+
+Can Kubernetes do this today? Yes. What else is needed? A training framework that exposes the parallelism dimensions (Megatron-LM, DeepSpeed, PyTorch FSDP, NeMo) and a gang scheduler configured with required clique placement.
 
 **Spanning works.** It just stops being free above 72 GPUs. The architect's job is making sure the 20x bandwidth cliff lands on the right traffic.
 
-### Inference parallelism
+<details>
+<summary><b>The detail behind it: all-reduce counts, why tensor parallelism stays at 8, and inference latency</b></summary>
+
+&nbsp;
+
+**How chatty is tensor parallelism?** Within a tensor-parallel group, each layer triggers two all-reduces on the forward pass (one after attention, one after the MLP) and two more on the backward pass. Llama-3.1-405B's 126 layers mean roughly 500 all-reduces per micro-batch, each moving a few hundred megabytes of activations at an 8K sequence length — hundreds of gigabytes of traffic per training step. Pipeline parallelism sends one activation tensor per micro-batch between adjacent stages, and data parallelism syncs gradients once per step, so tensor parallelism dominates total bandwidth, with pipeline parallelism a distant second and data parallelism a distant third.
+
+**Why 8 GPUs per tensor-parallel group, when NVL72 has 72 on NVLink?** On older 8-GPU servers, NVLink stopped at the server, so 8 was a hard limit. On NVL72 every GPU in the rack reaches every other GPU at full NVLink speed through the NVLink switch trays, so the server boundary (4 GPUs per compute tray) no longer matters — the rack boundary does. Tensor parallelism stays around 8 anyway for a software reason: splitting each layer into more pieces makes every piece too small to keep a GPU busy, while each all-reduce gets more expensive. NVL72's extra NVLink reach goes to expert parallelism in MoE models and to data-parallel groups that stay inside the rack.
+
+**Why inference is even more sensitive.** A tensor-parallel serving replica runs two all-reduces on every layer of every forward pass — one trip through the model's layers to produce one output token. Generating a 1,000-token response from Llama-3.1-405B therefore triggers roughly 250,000 all-reduces, and each one lands directly in user-visible latency. Training can absorb a slow collective — a 5 ms hiccup inside a 10-second step is invisible — but inference cannot: a small per-collective penalty repeats on every one of those 250,000 operations and becomes the dominant cost in serving latency. The fabric placement decision therefore applies at least as strongly to inference, which is the shape most Vera Rubin deployments run around the clock.
+
+**Training and inference use the same primitives for opposite purposes.** Tensor parallelism, gang scheduling, and NVLink-aware placement coordinate one giant workload in training, and isolate many small ones in inference: each inference replica is a self-contained serving unit of typically 2 to 8 GPUs on Rubin, scaling up and down with queue depth. MoE models served with wide expert parallelism are the exception and can span a whole rack. Training also needs far more memory than inference for the same model, because gradients and optimizer state come along with the weights.
+
+</details>
+
+## Part 2: The software layers that make it a platform
+
+The hardware sets the limits; the software decides how close the platform gets to them. This part covers which orchestrator to run, where hypervisors fit, how scheduling respects the rack boundary, what happens when something fails, how to keep GPUs busy around the clock, and how much of the stack is open source.
+
+![Platform layers from hardware to applications: Vera Rubin racks run bare metal, provisioned by NVIDIA Mission Control or open tooling; the application plane runs on separate CPU racks, bare metal or hypervisor; Slurm can optionally run on Kubernetes through Slinky or SUNK](./platform-stack.svg)
+
+The diagram shows every layer from hardware to applications, and the three places where the design has a real choice: who provisions the racks (NVIDIA's Mission Control or open tooling), whether the application plane — on its own racks of general-purpose servers, separate from the Vera Rubin racks — runs on a hypervisor, and whether Slurm runs on top of Kubernetes for teams that want it. The Vera Rubin racks themselves have no hypervisor choice: they run bare metal.
+
+### Is Kubernetes the right technology for this?
+
+A fair meta-question that sits above the technical architecture discussion and deserves a direct answer rather than a defensive one. The honest answer depends on the shape of the deployment.
+
+#### Where Kubernetes is the right answer
+
+- **Enterprise self-hosted AI platforms** — the use case this document is built around. The AI workload is one of many on the cluster; the orchestration layer also handles serving APIs, auth and policy, observability, agent orchestration logic, data access, and integration with the rest of the enterprise. Kubernetes is where that ecosystem already lives.
+- **Multi-tenant platforms** — namespaces, RBAC, network policies, resource quotas, and the whole platform-engineering model map cleanly. Alternatives either do not model multi-tenancy or require significant external tooling to approximate it.
+- **Hybrid or multi-cloud deployments** — the same platform runs on-premise, in private cloud, and in public cloud substantially unchanged. This matters when the GPU racks are on-premise but burst capacity, dev/test, or regional serving run in cloud.
+- **Teams with existing Kubernetes operational muscle** — if the platform team already runs Kubernetes for other workloads, extending into AI is a natural evolution rather than standing up a separate operational discipline.
+
+#### Where other orchestrators win
+
+- **Slurm** — the dominant scheduler in frontier AI research labs and traditional HPC. For a single-purpose cluster running one or two long training jobs on dedicated hardware, Slurm's simplicity, maturity, and batch-scheduling heritage are hard to beat. The gap closes when the cluster has to serve many consumers 24/7 rather than process a research queue.
+- **Ray and KubeRay** — Ray is a programming model and distributed computing framework, not an orchestrator in the Kubernetes sense. Most Kubernetes-based AI platforms run Ray on top (via KubeRay) rather than replacing Kubernetes with it. Standalone Ray clusters make sense for pure ML research workflows that do not need the surrounding platform.
+- **Nomad** — simpler, lighter, and genuinely well-designed for teams that find Kubernetes operational complexity hard to justify. Not widely used for frontier AI workloads today; the ecosystem (GPU operators, DRA, topology-aware scheduling) is far thinner than Kubernetes.
+- **Managed cloud services (SageMaker, Vertex AI, Azure ML)** — abstract orchestration away entirely. The right answer when the customer is willing to put the whole AI platform in a specific cloud, which usually conflicts with the IP-protection and cost-containment motivations that drive on-premises Vera Rubin deployments in the first place.
+
+#### Why Kubernetes has become the dominant pattern for enterprise AI specifically
+
+- **The ecosystem has matured dramatically.** DRA GA in Kubernetes 1.34, the NVIDIA DRA driver with ComputeDomains, Kueue with topology-aware scheduling, KubeRay, KServe plus vLLM for serving, Multus and SR-IOV for RDMA networking — the pieces that make rack-scale AI tractable on Kubernetes have all landed in the last 18–24 months.
+- **It unifies the AI workload with everything else.** The agent orchestration logic, the chat UI, the API gateway, the auth service, the vector database, the observability stack — none of these are AI workloads per se, but all of them need to run somewhere. Running them on the same substrate as the AI workload is the simplest operational posture.
+- **It is where enterprise skills already live.** The platform team's existing GitOps, policy, observability, and security tooling plugs into Kubernetes natively. Standing up a parallel Slurm cluster for the AI workload specifically means operating two platforms.
+
+#### The honest caveat
+
+Kubernetes is not simpler than Slurm for a single-purpose GPU research cluster. For "we need to run one 500-GPU training job for six weeks on dedicated hardware," Slurm is a smaller operational commitment and would work just as well. The reason to pick Kubernetes is that the self-hosted AI platform described in this document is not that use case — it is many workloads with many consumers running continuously, and that is the shape of problem Kubernetes was built for.
+
+Can Kubernetes do this today? Yes, for enterprise self-hosted AI platforms specifically.
+
+What else is needed? Nothing architectural. The question in this section is about fit, not capability. Slurm wins for single-purpose research clusters; Kubernetes wins where the AI workload is one of many on a shared platform.
+
+### Running Kubernetes on hypervisors (and why not for the GPU racks)
+
+#### Where Kubernetes-on-hypervisor earns its keep
+
+- **Reuse existing operational muscle.** The VI admin team already runs vSphere; the platform team focuses on the Kubernetes layer rather than owning bare-metal provisioning. The GPU racks still need bare-metal skills; those come from NVIDIA's proprietary Base Command Manager (part of Mission Control), from open provisioning tools such as Metal3 or Tinkerbell, or from a partner.
+- **Large multi-socket hosts.** A 4-socket server with hundreds of cores and terabytes of memory makes a poor single Kubernetes node: the kubelet allows 110 pods per node by default, memory access across sockets is slower than local access, and one host failure takes a large slice of the cluster with it. One VM per socket gives right-sized nodes with local memory and a smaller blast radius.
+- **Mixed workload consolidation.** The same physical cluster runs Kubernetes workloads alongside the long tail of legacy VMs that are not going away.
+- **vSphere availability guarantees.** HA, DRS, and vMotion give Kubernetes nodes availability properties that the Kubernetes layer does not natively provide — a worker node evacuates onto healthy hardware transparently.
+- **Storage, networking, and backup abstraction.** vSphere CSI, NSX microsegmentation, and VM-level backup via Veeam, Rubrik, or Cohesity give one operational regime that covers everything.
+
+#### Why it is the wrong answer for the Vera Rubin racks
+
+- **NVIDIA AI Enterprise support is bare-metal-only** for GH200, GB200, and GB300 NVL72 systems. Vera Rubin NVL72 will almost certainly inherit this constraint. Running Kubernetes workers as VMs on vSphere on those racks puts the deployment outside NVAIE support.
+- **MNNVL topology awareness assumes direct hardware access.** The GPU Operator's clique labeling, the DRA driver's ComputeDomain discovery, and Topograph's switch-tree mapping all assume the Kubernetes node is the physical node. These abstractions have not been designed or tested for VM-virtualized rack-scale NVL72.
+- **vGPU does not model this workload.** vGPU virtualizes a GPU across multiple VMs for VDI or lighter inference. Rack-scale NVLink training needs the opposite — one workload consuming many GPUs across many nodes with fabric coherence. Different problem entirely.
+- **Performance is not the main argument.** VMware's published MLPerf results put virtualized single-node H100 inference at 98–100% of bare metal. The case for bare metal on NVL72 rests on support and topology (above), not overhead — at this capex, even a few percent is worth keeping, but it is not what decides the question.
+
+This is a rack-scale NVLink rule, not a general GPU rule; see the Alternatives section for where a hypervisor fits on 8-GPU servers.
+
+#### The right pattern
+
+- **Bare-metal Kubernetes on the Vera Rubin racks** — inference, training, and everything that actually touches the GPUs.
+- **Kubernetes on vSphere (or whatever hypervisor) for everything else** — API gateways, auth services, observability, storage proxies, agent orchestration logic, and the application plane that calls out to the inference endpoints. These run on separate racks of general-purpose servers, not in the Vera Rubin racks.
+
+These can be one logical cluster (Kubernetes spanning bare-metal GPU nodes and virtualized worker nodes) or two separate clusters federated via GitOps and service mesh. Either works. What does not work is virtualizing the GPU racks themselves.
+
+#### The economic context worth naming
+
+Post-Broadcom licensing changes have reshaped the vSphere conversation. Perpetual licenses are gone, pricing has shifted to per-core subscription at substantially higher rates, and product bundling in VCF forces many customers to buy capabilities they do not use to get the ones they do. For many enterprises this has prompted a fresh evaluation of hypervisor alternatives (Nutanix AHV, KubeVirt via OpenShift Virtualization, SUSE Harvester, Proxmox for smaller shops) and a reconsideration of whether workloads that defaulted to VMs five years ago still need a hypervisor at all. For AI and GPU workloads specifically, the pricing shift accelerates an architectural answer that was already pointing toward bare-metal.
+
+#### The architectural principle underneath
+
+GPU state is fundamentally not migratable in the way CPU memory is, and designing the resilience story around redundancy and checkpoint-restart — rather than pretending we have mobility we do not — produces cleaner, cheaper, more predictable systems. VMware's genuine advantage in live migration applies to a problem shape (CPU-bound long-lived black-box VMs) that does not exist in the Vera Rubin deployment.
+
+Can Kubernetes do this today? Yes for the non-GPU portion of the deployment. No for the Vera Rubin racks themselves.
+
+What else is needed? For the application plane (API gateways, auth, observability, agent orchestration): any hypervisor path works (vSphere, KubeVirt, Nutanix AHV, SUSE Harvester). For the GPU racks: bare-metal Kubernetes is required for NVAIE support and for the MNNVL topology primitives to function.
+
+### Topology-aware gang scheduling
 
 Inference uses gang scheduling too, with a different purpose. For training, gang scheduling means "all N pods of this one job start together or none start" — the all-reduce collective requires every worker present. For inference, it means "all K GPUs of one serving replica are allocated atomically." You cannot have half a replica of a 405B model. On NVL72 this matters more than on 8-GPU servers: each compute tray holds 4 GPUs, so any replica larger than 4 GPUs spans two or more pods, and all of them must start together or the replica cannot serve. **LeaderWorkerSet** (a Kubernetes SIG Apps API that treats a group of pods as one unit) is the standard way to express that — llm-d and vLLM's multi-node deployment guides build on it — and the gang scheduler either places the whole group on topology-aligned nodes or waits.
 
@@ -176,7 +276,7 @@ Native Kubernetes gives you three topology primitives — **Topology Manager** (
 
 Topology constraints carry over to inference. A tensor-parallel serving replica wants its K GPUs on one NVLink domain for the all-reduce traffic on every forward pass. **Where training runs one gang-scheduled job across many GPUs, inference runs many parallel gang-scheduled replicas of the same model, each smaller (typically 2–8 GPUs on Rubin, more for MoE models served with wide expert parallelism) and scaling up and down based on queue depth.** The scheduler has to pack multiple inference replicas plus optional training jobs onto a rack without fragmenting the NVLink domain, which is where topology-aware placement earns its keep.
 
-## When a worker node fails: training vs inference
+### When a worker node fails: training vs inference
 
 Gang-scheduled jobs do not partially restart. If one worker in a 36- or 144-GPU job dies, the collective is broken and the whole job terminates. The sequence is:
 
@@ -197,7 +297,7 @@ Can Kubernetes do this today? Yes for the orchestration piece (reschedule the ga
 
 What else is needed? Framework-level checkpointing (PyTorch Distributed Checkpoint, DeepSpeed, Megatron-LM) for training resilience. For inference resilience, KServe plus N+1 replica design plus prefix cache strategy. Live migration of GPU workloads is still research territory for rack-scale NVLink jobs — NVIDIA cuda-checkpoint and CRIUgpu work for single-node CUDA workloads only.
 
-### What inference loses on a failure
+#### What inference loses on a failure
 
 **Inference resilience is a different story.** The checkpoint-and-restart pattern above is for long-running training jobs. Inference workloads have different failure characteristics and need different architectural answers.
 
@@ -206,7 +306,7 @@ What else is needed? Framework-level checkpointing (PyTorch Distributed Checkpoi
 - **Model reload is slow.** A 405B model in FP8 is roughly 405 GB of weights that have to be read from storage into GPU HBM across all tensor-parallel ranks. Cold-start is minutes, not seconds. For a platform where users and agents expect sub-second latency, a replica coming back online cold is a visible interruption. NVIDIA Dynamo's Snapshot capability (CRIU + CUDA checkpointing) is specifically targeted at this problem, cutting cold starts from minutes to seconds.
 - **Rack-level failure is where it gets serious.** Losing a full NVL72 rack hosting an inference deployment takes down everything on that rack. This is the single biggest argument for two-or-more-rack deployments — you cannot checkpoint-and-restart out of a user-visible outage.
 
-### Architectural answers for inference resilience
+#### Architectural answers for inference resilience
 
 - **N+1 replica design** at the serving layer — multiple vLLM replicas across different nodes and ideally different racks behind one KServe endpoint, load balancer routing around failures.
 - **Pre-warmed standby replicas** for frontier models — the cold-start cost makes "scale from zero on demand" the wrong pattern for primary inference. Keep spares warm.
@@ -214,7 +314,7 @@ What else is needed? Framework-level checkpointing (PyTorch Distributed Checkpoi
 - **Session affinity with graceful fallback** — route a conversation to the same replica when possible for KV cache reuse; fall back to any healthy replica with full re-ingestion when the sticky target is unavailable.
 - **Multi-rack deployment as the SLA mechanism** — the two-rack and four-rack sizing described in the 24/7 saturation section is not just about model variety and context length. It is also about inference redundancy. One rack failing cannot take the platform down.
 
-## The 24/7 saturation pattern: self-hosted frontier AI platforms
+### The 24/7 saturation pattern: self-hosted frontier AI platforms
 
 A Vera Rubin NVL72 rack lists in the multi-million-dollar range, and typical enterprise production deployments land in the two-to-four-rack range — well into eight figures before power, cooling, scale-out fabric, and support. At that capital expense, the business case assumes near-continuous utilization. The dominant workload driving that utilization is a self-hosted frontier AI platform that mirrors what Anthropic or OpenAI deliver centrally — interactive chat, coding agents, research and reasoning agents, document and codebase processing pipelines, and specialized domain assistants, all served from one cluster so that queries, source code, internal documents, and model weights never leave the security boundary.
 
@@ -222,7 +322,7 @@ Can Kubernetes do this today? Yes.
 
 What else is needed? Kueue for priority-class gang scheduling, KServe + vLLM (or an orchestration layer like llm-d or NVIDIA Dynamo at frontier scale) for serving, DCGM Exporter + Prometheus + Grafana for per-tenant attribution. All open source. For GPU slicing and multi-tenancy at the GPU level, HAMi (CNCF sandbox) is the newest and most active project.
 
-### Why self-host
+#### Why self-host
 
 - **Contain runaway hosted-API spend.** The 2023–2025 "blank check" AI budgets have closed. Finance now wants a predictable cost ceiling and demonstrable ROI, not an open-ended per-token invoice. Above a certain query volume, dedicated hardware beats hosted-API pricing by a wide margin, and the delta grows with context length and concurrency.
 - **Protect IP.** The data an enterprise has accumulated — customer records, operational history, source code, strategy documents, clinical outcomes, trading patterns — is the real competitive advantage, not the model. Keep all of it on-premise, out of third-party inference APIs, and out of anyone else's training data.
@@ -230,21 +330,21 @@ What else is needed? Kueue for priority-class gang scheduling, KServe + vLLM (or
 - **Latency.** Single-digit-millisecond network hop versus cross-region API round-trip.
 - **Model control.** The customer chooses when and whether to update, which fine-tunes to apply, and what safety filters to run.
 
-### The architecture pattern that delivers full saturation
+#### The architecture pattern that delivers full saturation
 
 - **Steady-state inference** — high-throughput serving of one or more frontier models to a mixed load: interactive human users (chat), autonomous agents (coding, research, document processing), and batch workflows. KServe (Kubernetes-native model serving) plus vLLM (continuous batching, paged attention, KV cache management, prefix caching) is the dominant open source stack. Prefix caching matters disproportionately as agent concurrency grows, since agents repeat the same system prompts and tool definitions thousands of times. **At frontier scale — multi-rack serving of frontier models with heavy agent load — the serving stack typically becomes an orchestration layer (llm-d or NVIDIA Dynamo) on top of vLLM or SGLang, rather than raw vLLM alone. The orchestration layer handles disaggregated prefill/decode, KV-aware routing across replicas, and multi-node coordination that single-engine serving cannot.**
 - **Scheduled training and fine-tuning** — continued pretraining, instruction tuning, RLHF cycles, and evaluation runs scheduled on dedicated node pools (physical separation) or during off-peak hours (temporal separation).
 - **Tiered priority queue management** — Kueue priority classes keep the stack honest under mixed load. Typical tiering: interactive humans > interactive agents > batch agents > training. Evictable training jobs (checkpoint-and-restart ready, per the previous section) backfill any inference capacity not actively in use, so GPUs are never idle.
 - **Multi-tenancy and per-workflow attribution** — namespace-per-team isolation, token-bucket rate limits per team and per agent, per-tenant and per-workflow usage attribution via DCGM metrics and application telemetry, chargeback dashboards from Prometheus. For agent-heavy loads, cost attribution shifts from "team X used Y tokens" to "the deploy agent cost $Z per invocation."
 
-### Rough sizing to anchor the conversation
+#### Rough sizing to anchor the conversation
 
 - One NVL72 rack (72 GPUs) running a Llama-3.1-405B-class model in FP8 can serve roughly 20,000 concurrent human chat users on paper, and about 10,000 once real-world efficiency and peak headroom are applied (both derived in the next section) — or far fewer concurrent agent workflows, since a single coding or research agent can burn 10–100x the tokens of a human user. Prefix cache hit rate (reused system prompts and tool definitions) swings effective throughput by 2–5x on agent-heavy load.
 - A two-rack (144-GPU) deployment typically buys one of three things: redundancy (one rack can fail and the platform stays up); longer context (KV cache room to serve 128K+ token windows at useful concurrency, which agents routinely need); or model variety (run several specialized models alongside the frontier one — e.g. a small fast model for cheap agent steps, a frontier model for the hard reasoning steps).
 - A four-rack (288-GPU) deployment is the typical enterprise production size in current customer conversations. It delivers all of the above at once: redundant frontier-model inference, long-context capacity, multiple specialized models in production, and reserved capacity for continuous training and fine-tuning cycles without starving inference. The step from two racks to four racks is often where the platform stops forcing operational tradeoffs between inference breadth and model freshness — you can keep the model current, serve humans and agents simultaneously, and survive a rack failure without a visible outage.
 - Actual numbers depend heavily on the human-vs-agent mix, sequence length distribution, prefix cache hit rate, batch size, and the specific vLLM configuration. Do a dedicated sizing exercise with the customer's workload mix rather than quoting a headline number.
 
-### How many of these models fit on one rack?
+#### How many of these models fit on one rack?
 
 Two different questions sit inside this one: how many **replicas** of a given model physically fit on a 72-GPU rack, and how many **concurrent users** those replicas can actually serve. The first is simple arithmetic. The second depends on workload shape and is where the real sizing exercise lives.
 
@@ -299,7 +399,11 @@ So a rack running Llama-3.1-405B at ~45,000 tokens/sec serves roughly 22,500 con
 
 The architectural lever that matters most sits above all of the above: the inference-to-training mix determines the final sizing, not the inference arithmetic alone. The tables and planning method above cover the inference half. Reserved capacity for training — continued pretraining, fine-tuning cycles, evaluation runs — can easily double the GPU count a customer needs. A customer who wants their self-hosted assistant to always be fresh (daily continued pretraining on new corpus) needs materially more capacity than one who fine-tunes quarterly. Capture that mix explicitly in the sizing exercise, not implicitly in the GPU count.
 
-## Common misconception: Kubernetes is not the boundary
+### Open source vs proprietary
+
+Two questions come up about the software layer once the architecture is clear: is Kubernetes itself the limit, and how much of the stack is actually open?
+
+#### Common misconception: Kubernetes is not the boundary
 
 Customers frequently frame the problem as "Kubernetes can't do spanning" or "Kubernetes can't handle the different networking planes." Both framings are wrong, and both tend to lead to the follow-up "so is NVIDIA solving this with their proprietary software?" The honest answer is no on both counts.
 
@@ -314,83 +418,13 @@ Multi-rack networking is solved by standard Kubernetes primitives. Every piece o
 
 **Is NVIDIA solving this with proprietary software?** No. Every component named above is Apache 2.0. The GPU Operator, DRA driver, Network Operator, Topograph, Multus, SR-IOV Operator, NCCL — all open source and all shipping today. NVIDIA Run:ai packages some of these behind a commercial UX and support contract, but the KAI Scheduler core at the heart of Run:ai was itself open-sourced under Apache 2.0 in 2025.
 
-What IS proprietary sits either below the OS (NVLink Fabric Manager runs on the switch trays, firmware-adjacent) or on top of the stack as commercial value-add (NIM inference containers, Run:ai control plane, NVIDIA AI Enterprise container distribution). None of it is required to make multi-rack NVLink spanning work on Kubernetes.
+What IS proprietary sits either below the OS (NVOS and NMX on the NVLink switch trays, firmware-adjacent) or on top of the stack as commercial value-add (NIM inference containers, Mission Control and its Base Command Manager and Run:ai control plane, NVIDIA AI Enterprise container distribution). None of it is required to make multi-rack NVLink spanning work on Kubernetes.
 
 Can Kubernetes do this today? Yes.
 
 What else is needed? Nothing new. This section is specifically about dispelling the misconception that Kubernetes is the limit — the answer is that every component needed is already open source and shipping.
 
-## Is Kubernetes the right technology for this?
-
-A fair meta-question that sits above the technical architecture discussion and deserves a direct answer rather than a defensive one. The honest answer depends on the shape of the deployment.
-
-### Where Kubernetes is the right answer
-
-- **Enterprise self-hosted AI platforms** — the use case this document is built around. The AI workload is one of many on the cluster; the orchestration layer also handles serving APIs, auth and policy, observability, agent orchestration logic, data access, and integration with the rest of the enterprise. Kubernetes is where that ecosystem already lives.
-- **Multi-tenant platforms** — namespaces, RBAC, network policies, resource quotas, and the whole platform-engineering model map cleanly. Alternatives either do not model multi-tenancy or require significant external tooling to approximate it.
-- **Hybrid or multi-cloud deployments** — the same platform runs on-premise, in private cloud, and in public cloud substantially unchanged. This matters when the GPU racks are on-premise but burst capacity, dev/test, or regional serving run in cloud.
-- **Teams with existing Kubernetes operational muscle** — if the platform team already runs Kubernetes for other workloads, extending into AI is a natural evolution rather than standing up a separate operational discipline.
-
-### Where other orchestrators win
-
-- **Slurm** — the dominant scheduler in frontier AI research labs and traditional HPC. For a single-purpose cluster running one or two long training jobs on dedicated hardware, Slurm's simplicity, maturity, and batch-scheduling heritage are hard to beat. The gap closes when the cluster has to serve many consumers 24/7 rather than process a research queue.
-- **Ray and KubeRay** — Ray is a programming model and distributed computing framework, not an orchestrator in the Kubernetes sense. Most Kubernetes-based AI platforms run Ray on top (via KubeRay) rather than replacing Kubernetes with it. Standalone Ray clusters make sense for pure ML research workflows that do not need the surrounding platform.
-- **Nomad** — simpler, lighter, and genuinely well-designed for teams that find Kubernetes operational complexity hard to justify. Not widely used for frontier AI workloads today; the ecosystem (GPU operators, DRA, topology-aware scheduling) is far thinner than Kubernetes.
-- **Managed cloud services (SageMaker, Vertex AI, Azure ML)** — abstract orchestration away entirely. The right answer when the customer is willing to put the whole AI platform in a specific cloud, which usually conflicts with the IP-protection and cost-containment motivations that drive on-premises Vera Rubin deployments in the first place.
-
-### Why Kubernetes has become the dominant pattern for enterprise AI specifically
-
-- **The ecosystem has matured dramatically.** DRA GA in Kubernetes 1.34, the NVIDIA DRA driver with ComputeDomains, Kueue with topology-aware scheduling, KubeRay, KServe plus vLLM for serving, Multus and SR-IOV for RDMA networking — the pieces that make rack-scale AI tractable on Kubernetes have all landed in the last 18–24 months.
-- **It unifies the AI workload with everything else.** The agent orchestration logic, the chat UI, the API gateway, the auth service, the vector database, the observability stack — none of these are AI workloads per se, but all of them need to run somewhere. Running them on the same substrate as the AI workload is the simplest operational posture.
-- **It is where enterprise skills already live.** The platform team's existing GitOps, policy, observability, and security tooling plugs into Kubernetes natively. Standing up a parallel Slurm cluster for the AI workload specifically means operating two platforms.
-
-### The honest caveat
-
-Kubernetes is not simpler than Slurm for a single-purpose GPU research cluster. For "we need to run one 500-GPU training job for six weeks on dedicated hardware," Slurm is a smaller operational commitment and would work just as well. The reason to pick Kubernetes is that the self-hosted AI platform described in this document is not that use case — it is many workloads with many consumers running continuously, and that is the shape of problem Kubernetes was built for.
-
-Can Kubernetes do this today? Yes, for enterprise self-hosted AI platforms specifically.
-
-What else is needed? Nothing architectural. The question in this section is about fit, not capability. Slurm wins for single-purpose research clusters; Kubernetes wins where the AI workload is one of many on a shared platform.
-
-## Running Kubernetes on hypervisors (and why not for the GPU racks)
-
-### Where Kubernetes-on-hypervisor earns its keep
-
-- **Reuse existing operational muscle.** The VI admin team already runs vSphere; the platform team focuses on the Kubernetes layer rather than owning bare-metal provisioning. The GPU racks still need bare-metal skills; those usually come from vendor provisioning tooling (NVIDIA Base Command Manager, part of Mission Control) or a partner rather than being built from scratch.
-- **Large multi-socket hosts.** A 4-socket server with hundreds of cores and terabytes of memory makes a poor single Kubernetes node: the kubelet allows 110 pods per node by default, memory access across sockets is slower than local access, and one host failure takes a large slice of the cluster with it. One VM per socket gives right-sized nodes with local memory and a smaller blast radius.
-- **Mixed workload consolidation.** The same physical cluster runs Kubernetes workloads alongside the long tail of legacy VMs that are not going away.
-- **vSphere availability guarantees.** HA, DRS, and vMotion give Kubernetes nodes availability properties that the Kubernetes layer does not natively provide — a worker node evacuates onto healthy hardware transparently.
-- **Storage, networking, and backup abstraction.** vSphere CSI, NSX microsegmentation, and VM-level backup via Veeam, Rubrik, or Cohesity give one operational regime that covers everything.
-
-### Why it is the wrong answer for the Vera Rubin racks
-
-- **NVIDIA AI Enterprise support is bare-metal-only** for GH200, GB200, and GB300 NVL72 systems. Vera Rubin NVL72 will almost certainly inherit this constraint. Running Kubernetes workers as VMs on vSphere on those racks puts the deployment outside NVAIE support.
-- **MNNVL topology awareness assumes direct hardware access.** The GPU Operator's clique labeling, the DRA driver's ComputeDomain discovery, and Topograph's switch-tree mapping all assume the Kubernetes node is the physical node. These abstractions have not been designed or tested for VM-virtualized rack-scale NVL72.
-- **vGPU does not model this workload.** vGPU virtualizes a GPU across multiple VMs for VDI or lighter inference. Rack-scale NVLink training needs the opposite — one workload consuming many GPUs across many nodes with fabric coherence. Different problem entirely.
-- **Performance is not the main argument.** VMware's published MLPerf results put virtualized single-node H100 inference at 98–100% of bare metal. The case for bare metal on NVL72 rests on support and topology (above), not overhead — at this capex, even a few percent is worth keeping, but it is not what decides the question.
-
-This is a rack-scale NVLink rule, not a general GPU rule; see the Alternatives section for where a hypervisor fits on 8-GPU servers.
-
-### The right pattern
-
-- **Bare-metal Kubernetes on the Vera Rubin racks** — inference, training, and everything that actually touches the GPUs.
-- **Kubernetes on vSphere (or whatever hypervisor) for everything else** — API gateways, auth services, observability, storage proxies, agent orchestration logic, and the application plane that calls out to the inference endpoints.
-
-These can be one logical cluster (Kubernetes spanning bare-metal GPU nodes and virtualized worker nodes) or two separate clusters federated via GitOps and service mesh. Either works. What does not work is virtualizing the GPU racks themselves.
-
-### The economic context worth naming
-
-Post-Broadcom licensing changes have reshaped the vSphere conversation. Perpetual licenses are gone, pricing has shifted to per-core subscription at substantially higher rates, and product bundling in VCF forces many customers to buy capabilities they do not use to get the ones they do. For many enterprises this has prompted a fresh evaluation of hypervisor alternatives (Nutanix AHV, KubeVirt via OpenShift Virtualization, SUSE Harvester, Proxmox for smaller shops) and a reconsideration of whether workloads that defaulted to VMs five years ago still need a hypervisor at all. For AI and GPU workloads specifically, the pricing shift accelerates an architectural answer that was already pointing toward bare-metal.
-
-### The architectural principle underneath
-
-GPU state is fundamentally not migratable in the way CPU memory is, and designing the resilience story around redundancy and checkpoint-restart — rather than pretending we have mobility we do not — produces cleaner, cheaper, more predictable systems. VMware's genuine advantage in live migration applies to a problem shape (CPU-bound long-lived black-box VMs) that does not exist in the Vera Rubin deployment.
-
-Can Kubernetes do this today? Yes for the non-GPU portion of the deployment. No for the Vera Rubin racks themselves.
-
-What else is needed? For the application plane (API gateways, auth, observability, agent orchestration): any hypervisor path works (vSphere, KubeVirt, Nutanix AHV, SUSE Harvester). For the GPU racks: bare-metal Kubernetes is required for NVAIE support and for the MNNVL topology primitives to function.
-
-## The open source stack
+#### The open source stack
 
 Every component in the following table is open source, and Apache 2.0 unless noted: PyTorch (including DCP), TorchFT, and Megatron-LM are BSD 3-clause, and Grafana is AGPLv3. The entire multi-rack Vera Rubin architecture — single-rack jobs, spanning jobs, fault recovery — is implementable on vanilla Kubernetes with these components, no vendor distribution required.
 
@@ -418,11 +452,12 @@ Can Kubernetes do this today? Yes, entirely.
 
 What else is needed? Everything in the table in this section — all open source, with licenses as noted above. No proprietary dependencies in the critical path.
 
-## What stays proprietary
+#### What stays proprietary
 
-Five pieces of the stack remain closed-source. Each sits either below the OS or on top of the open-source core as commercial value-add. None is architecturally required.
+Six pieces of the stack remain closed-source. Each sits either below the OS or on top of the open-source core as commercial value-add. None is architecturally required.
 
-- **GPU firmware and NVLink Fabric Manager.** The Fabric Manager runs on the NVLink switch trays, below the host OS. Hardware-adjacent, no open-source equivalent possible. Kubernetes does not interact with it directly — the fabric comes up before Linux boots.
+- **GPU firmware and NVLink fabric software.** On NVL72 the NVLink switch trays run NVIDIA's NVOS, and NMX manages the NVLink fabric. Hardware-adjacent, no open-source equivalent possible. Kubernetes does not interact with it directly; it is managed from the switch trays, independently of the compute trays' operating system.
+- **Mission Control and Base Command Manager.** NVIDIA's cluster management suite bundles Base Command Manager (provisioning and firmware), Run:ai (workload management), and UFM (InfiniBand fabric management). For DGX GB200 systems, BCM's NVLink support and firmware update tool require a Mission Control license. Open tools cover OS provisioning (Metal3, Tinkerbell); firmware and NVLink switch configuration then become the team's own automation.
 - **CUDA user-space runtime.** The GPU kernel modules have an open variant (`nvidia-open`), but the user-space CUDA libraries are proprietary. Hard dependency for any GPU workload on NVIDIA silicon.
 - **NIM microservices.** NVIDIA's optimized inference containers. Built on open bases (vLLM, TensorRT-LLM) and distributed as closed, versioned, support-eligible images.
 - **Run:ai control plane.** The KAI Scheduler core is Apache 2.0, but Run:ai's UX, quota management, and multi-tenancy features remain commercial.
@@ -432,19 +467,9 @@ The pattern: what is proprietary is either hardware-adjacent or wraps open compo
 
 Can Kubernetes do this today? Yes, without any of the proprietary pieces.
 
-What else is needed? The five proprietary items (GPU firmware, CUDA user-space, NIM, Run:ai control plane, NVAIE container distribution) are optional value-add or hardware-adjacent. None of them are architectural dependencies.
+What else is needed? The six proprietary items (GPU firmware and NVLink switch software, Mission Control and Base Command Manager, CUDA user-space, NIM, Run:ai control plane, NVAIE container distribution) are optional value-add or hardware-adjacent. None of them are architectural dependencies.
 
-## What this means for architects
-
-Three takeaways to carry into customer conversations:
-
-1. **No lock-in on the orchestration layer.** Topology-aware gang scheduling across NVL72 racks is implementable with Kueue alone — the customer is not forced into Run:ai to get MNNVL scheduling. If they later want Run:ai's UX, that becomes a choice, not a dependency.
-2. **NVAIE becomes an informed choice, not a default assumption.** Buy it if the customer wants NIM for optimized inference, an enterprise SLA on the CUDA / driver layer, or the Run:ai control plane. Do not buy it because "the hardware requires it" — it does not.
-3. **Distribution is a support decision, not an architectural one.** Upstream Kubernetes, OpenShift AI, GKE AI Hypercomputer, EKS with the GB200 recipes — all ship the same underlying operators. The right distribution is the one whose support model fits the customer's operating muscle. For regulated enterprises, a curated distribution with a single support contract usually wins; for AI-native companies with strong platform engineering, upstream is viable.
-
-The hardware is the exciting part of a Vera Rubin conversation. The scheduling architecture is where the customer actually earns the performance — and it is 100% open source. That architecture pattern carries forward even when the hardware choice does not, which is what the next section explores.
-
-## Alternatives to Vera Rubin: GPUs, networking, and scale-up fabrics
+## Part 3: Alternative hardware designs
 
 Not every customer will land on Vera Rubin NVL72. The common reasons: allocation (hyperscaler-first through H2 2026, enterprise availability tracking later), capital constraints (Rubin is the premium tier), workload fit (inference-only or smaller models may not justify frontier silicon), and strategic diversification (customers increasingly reluctant to single-vendor on silicon this expensive). This section covers the realistic alternatives at the GPU, scale-out network, and scale-up fabric layers, and what actually changes architecturally when you substitute them.
 
@@ -456,7 +481,7 @@ In rough tiers from "shipping today" to "frontier bets":
 - **NVIDIA HGX B200 / B300 (air-cooled 8-GPU boards)** — the non-rack-scale Blackwell path. Fits standard data center cooling, small NVLink domain (8 GPUs per node), suitable for smaller training clusters and distributed inference. Lower upfront commitment and lower per-cluster performance ceiling.
 - **NVIDIA H200** — the Hopper refresh. Still fully supported and still the workhorse of many existing deployments. Good fit for inference-dominant workloads where the Blackwell or Rubin premium is not justified yet.
 - **AMD Instinct MI350 / MI355X** — AMD's current frontier GPUs, competitive on raw compute and typically ahead on HBM capacity per GPU. ROCm software stack has closed much of the gap with CUDA; vLLM, PyTorch, and most major frameworks support ROCm natively. Weaker rack-scale story than NVIDIA today (no NVL72 equivalent).
-- **AMD Instinct MI400 (Helios)** — AMD's answer to NVL72-class rack-scale, announced for 2026 timing and pairing with the first UALink-based open scale-up fabric. Worth tracking closely for customers who want a serious NVIDIA alternative at the rack-scale tier. Verify shipping status with AMD before committing in writing.
+- **AMD Instinct MI400 series (Helios)** — AMD's answer to NVL72-class rack scale: 72 MI455X GPUs with 432 GB of HBM4 each. The first systems carry UALink over Ethernet rather than native UALink. AMD says Helios ships in the second half of 2026, and analysts expect volume production in 2027, so verify delivery dates with AMD before committing in writing.
 - **Intel Gaudi 3** — competitive price/performance for training specifically, meaningfully cheaper per training FLOP than NVIDIA, with a dedicated Habana software stack. Ecosystem is thinner than CUDA or ROCm. Gaudi 4 has been announced; verify shipping status.
 - **Hyperscaler custom silicon (AWS Trainium 2/3, Google TPU v6/v7)** — cloud-only, no on-premises path. Relevant only if the customer is willing to put the self-hosted AI platform in a specific cloud rather than their own data center, which usually conflicts with the IP-protection motivation driving on-premises in the first place.
 - **Specialized inference silicon (Groq LPU, Cerebras CS-3, SambaNova SN40L)** — niche fits. Groq is extreme-low-latency inference for specific model sizes. Cerebras is wafer-scale training with a distinct programming model. SambaNova is appliance-form-factor. None of these replaces a general-purpose rack-scale GPU platform, but they can complement one for specific workloads.
@@ -472,9 +497,25 @@ In rough tiers from "shipping today" to "frontier bets":
 
 This is the hardest NVIDIA capability to match. NVLink is proprietary, physically integrated into the rack, and generations ahead of any shipping alternative:
 
-- **UALink (Ultra Accelerator Link)** — the consortium formed in 2024 with AMD, Intel, Google, Meta, Microsoft, HPE, Astera Labs, and others. Explicit goal: an open NVLink-class scale-up fabric usable across GPU vendors. UALink 1.0 silicon is expected in 2026–2027, likely paired with AMD MI400 as the headline deployment. For now, UALink is a strategic bet on the future, not a shipping alternative today.
+- **UALink (Ultra Accelerator Link)** — the consortium formed in 2024 with AMD, Intel, Google, Meta, Microsoft, HPE, Astera Labs, and others. Explicit goal: an open NVLink-class scale-up fabric usable across GPU vendors. AMD's Helios is the first rack-scale system built around it, but its initial version carries UALink over Ethernet (UALoE) rather than using native UALink switches. Native UALink remains a bet on the next generation.
 - **AMD Infinity Fabric** — proprietary AMD scale-up for multi-die GPUs and CPU-GPU coherence. Works within AMD's own stack but not rack-scale in the NVL72 sense.
-- **No shipping alternative today** for connecting non-NVIDIA GPUs across racks at NVLink-class bandwidth. This is the single biggest structural NVIDIA advantage, and the one UALink is explicitly designed to erode over the next two to three years.
+- **No volume-shipping alternative yet** for connecting non-NVIDIA GPUs at NVLink-class bandwidth. Helios matches NVL72's headline scale-up figure — 260 TB/s per rack, about 3.6 TB/s per GPU — but is only starting to ship. This is the single biggest structural NVIDIA advantage, and the gap is closing.
+
+### The best non-NVIDIA fit
+
+![The best non-NVIDIA fit on the same Kubernetes platform: AMD Helios or MI355X servers, with the layers that stay the same, the components that are swapped, the decisions, and the rack-domain topology gap marked](./alternative-stack.svg)
+
+If the customer rules out NVIDIA entirely, the closest match to Vera Rubin NVL72 is AMD's Helios rack: 72 MI455X GPUs, 432 GB of HBM4 each (about 31 TB per rack), and a 260 TB/s scale-up domain — about 3.6 TB/s per GPU, the same headline figure as NVLink 6. The first Helios systems carry UALink over Ethernet rather than native UALink. AMD says Helios ships in the second half of 2026, with volume production expected in 2027. For deployments that cannot wait, MI355X servers ship today, with a smaller scale-up domain of 8 GPUs per server.
+
+**What carries over unchanged** is most of this document: Kubernetes, Kueue or Volcano, Slurm on Kubernetes if the team wants it, Multus and SR-IOV, KServe, vLLM and SGLang (both with upstream ROCm support), PyTorch, Prometheus and Grafana, and the separate application-plane racks with their hypervisor decision. The parallelism rules carry over too, with the Helios rack as the scale-up boundary instead of the NVL72 rack.
+
+**What swaps:**
+
+- **GPU software.** ROCm replaces CUDA, and ROCm is open source, which removes one of the proprietary pieces listed in Part 2. RCCL replaces NCCL. AMD's GPU Operator, which now includes a DRA driver, replaces NVIDIA's.
+- **Fabrics.** UALink over Ethernet inside the rack; Ultra Ethernet between racks, with AMD Pensando NICs and Arista or Broadcom-based switches.
+- **Provisioning.** There is no Mission Control to license. Open tooling (Metal3, Tinkerbell) or the OEM's rack tools provision the racks.
+
+**The gap to close first.** NVIDIA's DRA driver tells Kubernetes which nodes share an NVLink domain (ComputeDomains). As of this writing, AMD has not published an equivalent for Helios's scale-up domain. Kueue's topology-aware scheduling can place jobs by rack using ordinary node labels, which covers the placement rule, but confirm with AMD what replaces ComputeDomains before committing to rack-spanning jobs on Helios.
 
 ### What actually changes architecturally when you substitute
 
@@ -492,8 +533,9 @@ This is the hardest NVIDIA capability to match. NVLink is proprietary, physicall
 ### How to frame the alternatives conversation with customers
 
 - **If Rubin availability is the blocker:** GB300 NVL72 or GB200 NVL72 is the pragmatic 2026–2027 answer. Same architectural pattern, available now, well-supported.
-- **If NVIDIA lock-in is the strategic concern:** AMD MI400 + UALink + Ultra Ethernet is the credible alternative stack coming together through 2026–2027. For deployments shipping sooner, AMD MI350 on Ethernet is a real option today for teams willing to invest in ROCm.
+- **If NVIDIA lock-in is the strategic concern:** AMD Helios (MI455X) with UALink over Ethernet inside the rack and Ultra Ethernet between racks is the credible alternative stack, shipping from the second half of 2026 (see the best non-NVIDIA fit above). For deployments shipping sooner, AMD MI350 on Ethernet is a real option today for teams willing to invest in ROCm.
 - **If budget is the primary constraint:** Intel Gaudi 3 for training workloads, or NVIDIA H200 for inference-dominant workloads, each at substantially lower cost per useful FLOP than Blackwell or Rubin.
+- **If proprietary management software is the concern:** this is often where the alternatives conversation starts. Mission Control and Base Command Manager are NVIDIA-only, and a new rack design adds uncertainty about how that tooling will evolve. Changing silicon is not the only answer: keep the NVL72 hardware and swap the management layer for open components — Metal3 or Tinkerbell for provisioning, Kueue or KAI for scheduling, DCGM Exporter with Prometheus for monitoring. What stays NVIDIA regardless is the firmware, the NVLink switch software, and CUDA.
 - **If the workload is specialized:** inference-dominant workloads at extreme latency may fit Groq; wafer-scale training may fit Cerebras; most other specializations do not justify leaving the generalist GPU path.
 
 Can Kubernetes do this today? Yes on AMD and Intel GPUs with the same architectural pattern.
@@ -501,6 +543,54 @@ Can Kubernetes do this today? Yes on AMD and Intel GPUs with the same architectu
 What else is needed? Different device plugins (AMD GPU Operator, Intel Gaudi Operator), different collective library (RCCL instead of NCCL for AMD, HCCL for Gaudi). The Kubernetes substrate, gang scheduler, and serving stack carry over substantially unchanged. The CUDA ecosystem lead on NVIDIA translates to more platform engineering effort on non-NVIDIA stacks, not fundamental infeasibility.
 
 Underneath all of these alternatives: the Kubernetes architecture, the open source stack, the scheduling model, and the workload patterns described throughout this document stay the same. The silicon and the fabric change; the platform pattern does not.
+
+## Part 4: Operational on day one
+
+![Day 0 before the racks arrive, day 1 bring-up and validation, day 2 operations](./day-0-1-2.svg)
+
+A Vera Rubin rack that arrives before its platform is ready is capital earning nothing. The point of everything in Parts 1–3 is that on the day the racks hit the floor, the remaining work is bring-up and validation, not design. That splits the work into three phases.
+
+### Day 0: before the racks arrive
+
+- **Facility.** Vera Rubin NVL72 is 100% liquid-cooled with no air-cooled option, so power, cooling loops, and floor space are long-lead items that have to be ready before delivery.
+- **Network.** The three planes from Part 1 are designed, cabled where possible, and their switch configurations kept as code.
+- **The software platform.** The Kubernetes control plane, the application plane on its own racks of general-purpose servers (bare metal or hypervisor), GitOps repositories, Kueue queues and priority classes, the serving stack, and dashboards are all running before the racks arrive. Almost everything above the GPU Operator is hardware-agnostic, so it can be built and tested on existing NVIDIA GPU nodes; only the NVL72-specific pieces — clique labels and ComputeDomains — have to wait for the racks.
+- **Models and data.** Model weights staged on local storage, evaluation sets ready, and the first fine-tuning corpus prepared, so the first jobs can start as soon as validation passes.
+- **Acceptance criteria.** What "working" means — diagnostics passing, NVLink and NCCL bandwidth targets, burn-in duration — agreed in writing with the vendor before delivery, not negotiated afterward.
+
+### Day 1: the racks land
+
+NVIDIA's detailed rack bring-up guides are written for GB200/GB300 NVL72, which Vera Rubin NVL72 follows in shape. With a new design, expect tooling details to keep moving through the first deployments, and that uncertainty, together with the proprietary management stack, is often where customers start weighing alternatives (Part 3).
+
+1. **Power on and provision.** The compute trays, NVLink switch trays, and power shelves are discovered, the operating system is installed, and firmware is brought to one consistent version across the rack. There are two paths:
+    - **NVIDIA's path: Mission Control.** Base Command Manager does all of this, but it is proprietary, and for DGX GB200 systems its NVLink support and firmware update tool require a Mission Control license.
+    - **The open path.** Metal3 (CNCF incubating, which drives each tray's BMC through Ironic over Redfish) or Tinkerbell (CNCF sandbox) handles OS provisioning; firmware updates and NVLink switch configuration become the team's own automation or the OEM's. More integration work, no management-software lock-in.
+2. **Bring up the NVLink fabric.** The NVLink switch trays run NVIDIA's NVOS, and NMX manages the rack's NVLink fabric. This piece is NVIDIA software on either path.
+3. **Validate the hardware, bottom up.** DCGM diagnostics on each node, then nvbandwidth for NVLink bandwidth, then NCCL tests per node, per rack, and across racks, then storage throughput, then a sustained burn-in. Each stage gates the next, and failures go on a punch list for the vendor.
+4. **Join the cluster.** Nodes join Kubernetes. The GPU Operator installs drivers and labels each node with its clique; the DRA driver publishes ComputeDomains, which set up IMEX — the service that lets GPUs on different trays share memory over NVLink — automatically around each job.
+5. **Rerun the Day 0 workloads on the racks.** A multi-tray NCCL job inside a ComputeDomain, a gang-scheduled training job that survives a killed pod and restarts from its checkpoint, and a serving deployment that keeps answering when one replica fails.
+
+### Day 2: operate
+
+- **Keep GPUs busy.** The priority-queue pattern from Part 2: inference first, training backfilling idle capacity.
+- **Watch health continuously.** DCGM health checks and NVLink monitoring flag failing hardware. A compute tray is a Kubernetes node, so draining and replacing one is routine: the scheduler routes around it, and affected training jobs restart from checkpoint.
+- **Upgrade one rack at a time.** Firmware, driver, and Kubernetes upgrades roll rack by rack while the other racks keep serving; the multi-rack N+1 design from Part 2 is what makes that possible.
+- **Feed the next sizing round.** Per-tenant chargeback data shows which workloads are growing, which is the input the next capacity plan needs.
+
+Can Kubernetes do this today? Yes for joining, scheduling, and operating the racks. Bring-up below the operating system — firmware, the NVLink fabric, burn-in — happens before Kubernetes is involved.
+
+What else is needed? Rack provisioning — NVIDIA Mission Control with Base Command Manager, or open tooling such as Metal3 or Tinkerbell plus the team's own automation for firmware and NVLink switch configuration — the validation tools above (DCGM, nvbandwidth, NCCL tests), and a GitOps repository that holds the whole platform definition, so it can be applied to the racks the day they pass validation.
+
+## What this means for architects
+
+Four takeaways to carry into customer conversations:
+
+1. **No lock-in on the orchestration layer.** Topology-aware gang scheduling across NVL72 racks is implementable with Kueue alone — the customer is not forced into Run:ai to get MNNVL scheduling. If they later want Run:ai's UX, that becomes a choice, not a dependency.
+2. **NVAIE becomes an informed choice, not a default assumption.** Buy it if the customer wants NIM for optimized inference, an enterprise SLA on the CUDA / driver layer, or the Run:ai control plane. Do not buy it because "the hardware requires it" — it does not.
+3. **Distribution is a support decision, not an architectural one.** Upstream Kubernetes, OpenShift AI, GKE AI Hypercomputer, EKS with the GB200 recipes — all ship the same underlying operators. The right distribution is the one whose support model fits the customer's operating muscle. For regulated enterprises, a curated distribution with a single support contract usually wins; for AI-native companies with strong platform engineering, upstream is viable.
+4. **Build the platform before the racks arrive.** Everything above the GPU Operator can be built and tested on existing GPU nodes, and acceptance criteria can be agreed before delivery. Done that way, the day the racks land is bring-up and validation, not design.
+
+The hardware is the exciting part of a Vera Rubin conversation. The scheduling architecture is where the customer actually earns the performance — and it is 100% open source. That architecture pattern carries forward even when the hardware choice does not, as Part 3 shows.
 
 ## References
 
@@ -597,6 +687,18 @@ Organized by topic. Each link was verified during the research for this doc.
 - NVIDIA Docs — [NVAIE Support Matrix (release 7)](https://docs.nvidia.com/ai-enterprise/release-7/latest/support/support-matrix.html)
 - NVIDIA Docs — [NVAIE Quick Start Guide](https://docs.nvidia.com/ai-enterprise/release-7/latest/getting-started/quick-start-guide.html)
 
+### AMD alternative stack
+
+- AMD Blog — [AMD Helios: Resilient Scale-Up Networking for AI](https://www.amd.com/en/blogs/2026/amd-helios-resilient-scale-up-networking-for-ai.html)
+- StorageReview — [AMD MI455X and Helios: 432GB HBM4, 72-GPU Racks](https://www.storagereview.com/news/amd-mi455x-and-helios-432gb-hbm4-72-gpu-racks-and-a-real-answer-to-vera-rubin)
+- The Next Platform — [AMD Says Helios Racks and MI400 Series GPUs On Track for 2H 2026](https://www.nextplatform.com/compute/2026/02/23/amd-says-helios-racks-and-mi400-series-gpus-on-track-for-2h-2026/4092199)
+- Tom's Hardware — [Helios initial systems use UALink-over-Ethernet interconnects](https://www.tomshardware.com/tech-industry/artificial-intelligence/amds-helios-mi455x-ai-platform-breaks-cover-initial-systems-use-ualink-over-ethernet-interconnects-amds-vera-rubin-rival-surfaces-but-the-downsides-of-ethernet-could-hamstring-performance)
+- ROCm Blogs — [AMD GPU Operator v1.5.0: DRA Support](https://rocm.blogs.amd.com/software-tools-optimization/gpu-operator-1.5.0/README.html)
+- GitHub — [AMD GPU DRA driver for Kubernetes](https://github.com/ROCm/k8s-gpu-dra-driver)
+- GitHub — [AMD GPU Operator](https://github.com/ROCm/gpu-operator)
+- ServeTheHome — [AMD Pensando Pollara 400 Ultra Ethernet RDMA NIC](https://www.servethehome.com/amd-pensando-pollara-400-ultraethernet-rdma-nic-launched/)
+- vLLM Blog — [How vLLM Orchestrates High-Performance Inference on AMD ROCm](https://vllm.ai/blog/2026-02-27-rocm-attention-backend)
+
 ### GPU virtualization below rack scale (HGX and PCIe)
 
 - NVIDIA Docs — [Fabric Manager User Guide (full passthrough, shared NVSwitch, and vGPU virtualization models)](https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html)
@@ -605,6 +707,20 @@ Organized by topic. Each link was verified during the research for this doc.
 - Broadcom TechDocs — [Configure NVIDIA vGPU or GPU Passthrough for AI Workloads on the ESX Hosts](https://techdocs.broadcom.com/us/en/vmware-cis/private-ai/foundation-with-nvidia/9-0/private-ai-foundation-9-x/deploying-private-ai-foundation-with-nvidia/configure-nvidia-vgpu-or-gpu-passthrough-on-the-esx-hosts.html)
 - VMware Blog — [Large Language Model Inference Performance with NVIDIA AI Enterprise for VMware vSphere (H100 vGPU, near bare-metal MLPerf results)](https://blogs.vmware.com/cloud-foundation/2023/10/02/vsphere-nvaie-llm/)
 - VMware Blog — [No Virtualization Tax for MLPerf Inference 3.0 Using NVIDIA Hopper and Ampere vGPUs](https://blogs.vmware.com/performance/2023/04/no-virtualization-tax-for-mlperf-inference-v3-0-using-nvidia-hopper-and-ampere-vgpus-and-nvidia-ai-software-with-vsphere-8-0-1.html)
+
+### Rack bring-up and day-one operations
+
+- NVIDIA Docs — [Mission Control: GB200/GB300 Rack Power On and Bring Up](https://docs.nvidia.com/mission-control/docs/rack-bring-up-install/2.0.0/rack-bring-up.html)
+- NVIDIA Docs — [Mission Control: Deployment Summary Validation Checklist](https://docs.nvidia.com/mission-control/docs/rack-bring-up-install/2.0.0/deployment-summary-validation-checklist.html)
+- NVIDIA Docs — [Mission Control: GB200/GB300 Rack Firmware Update](https://docs.nvidia.com/mission-control/docs/rack-bring-up-install/2.1.0/rack-firmware-update.html)
+- NVIDIA Developer Blog — [Enabling Multi-Node NVLink on Kubernetes for GB200 and Beyond (ComputeDomains and IMEX)](https://developer.nvidia.com/blog/enabling-multi-node-nvlink-on-kubernetes-for-gb200-and-beyond/)
+- NVIDIA Docs — [DRA Driver for NVIDIA GPUs (GPU Operator)](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/dra-intro-install.html)
+- NVIDIA Docs — [Mission Control documentation (Base Command Manager, Run:ai, UFM)](https://docs.nvidia.com/mission-control/index.html)
+- NVIDIA Docs — [Base Command Manager 11 release notes (GB200 NVLink support and firmware tool require Mission Control)](https://docs.nvidia.com/base-command-manager/bcm-11-release-notes/overview.html)
+- NVIDIA Docs — [Software Download, Installation and Activation: DGX GB300/GB200 and Vera Rubin NVL72 Systems](https://docs.nvidia.com/software-installation-gb300-gb200/index.html)
+- CNCF — [Metal3.io becomes a CNCF incubating project (bare-metal provisioning via Ironic and Redfish)](https://www.cncf.io/blog/2025/08/27/metal3-io-becomes-a-cncf-incubating-project/)
+- Tinkerbell — [Tinkerbell (CNCF sandbox, workflow-based bare-metal provisioning)](https://tinkerbell.org/)
+- SemiAnalysis — [Vera Rubin: Extreme Co-Design (100% liquid cooling, 45 °C supply)](https://newsletter.semianalysis.com/p/vera-rubin-extreme-co-design-an-evolution)
 
 ### Who schedules frontier training today
 
